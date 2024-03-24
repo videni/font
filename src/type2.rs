@@ -1,4 +1,4 @@
-use crate::{State, v, Value, Context, TryIndex, FontError};
+use crate::{v, Context, FontError, Pen, State, TryIndex, Value};
 use nom::{IResult,
     bytes::complete::{take},
     number::complete::{be_u8, be_i16, be_i32}
@@ -32,7 +32,7 @@ macro_rules! bezier {
             let c1 = $s.current + point!(iter, $a);
             let c2 = c1 + point!(iter, $b);
             let p = c2 + point!(iter, $c);
-            $s.contour.push_cubic(c1, c2, p);
+            $s.pen.cubic_to(c1, c2, p);
             $s.current = p;
         )*
         iter.as_slice()
@@ -43,14 +43,14 @@ macro_rules! lines {
         let mut iter = $slice.iter();
         $(
             let p = $s.current + point!(iter, $a);
-            $s.contour.push_endpoint(p);
+            $s.pen.line_to(p);
             $s.current = p;
         )*
         iter.as_slice()
     });
 }
 
-fn alternating_curve(s: &mut State, mut horizontal: bool) -> Result<(), FontError> {
+fn alternating_curve(s: &mut State<impl Pen>, mut horizontal: bool) -> Result<(), FontError> {
     let mut slice = s.stack.as_slice();
     while slice.len() > 0 {
         slice = match (slice.len(), horizontal) {
@@ -65,7 +65,7 @@ fn alternating_curve(s: &mut State, mut horizontal: bool) -> Result<(), FontErro
 }
 
 #[inline]
-fn maybe_width(state: &mut State, cond: impl Fn(usize) -> bool) {
+fn maybe_width(state: &mut State<impl Pen>, cond: impl Fn(usize) -> bool) {
     if state.first_stack_clearing_operator {
         state.first_stack_clearing_operator = false;
         if !cond(state.stack.len()) {
@@ -74,7 +74,7 @@ fn maybe_width(state: &mut State, cond: impl Fn(usize) -> bool) {
         }
     }
 }
-pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State) -> Result<(), FontError>
+pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State<impl Pen>) -> Result<(), FontError>
     where T: TryIndex + 'a, U: TryIndex + 'a
 {
     while input.len() > 0 && !s.done {
@@ -103,11 +103,10 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
             4 => { // ⊦ dy vmoveto (4) ⊦
                 trace!("vmoveto");
                 require!(s.stack.len() >= 1);
-                s.flush();
 
                 maybe_width(s, |n| n == 1);
                 let p = s.current + v(0., s.stack[0]);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.stack.clear();
                 s.current = p;
                 i
@@ -131,7 +130,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                         v(0., d)
                     };
                     let p = s.current + dv;
-                    s.contour.push_endpoint(p);
+                    s.pen.line_to(p);
                     s.current = p;
                 }
                 s.stack.clear();
@@ -147,7 +146,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                         v(d, 0.)
                     };
                     let p = s.current + dv;
-                    s.contour.push_endpoint(p);
+                    s.pen.line_to(p);
                     s.current = p;
                 }
                 s.stack.clear();
@@ -347,7 +346,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                             true => point!(iter, x),
                             false => point!(iter, y)
                         };
-                        s.contour.push_cubic(d4, d5, d6);
+                        s.pen.cubic_to(d4, d5, d6);
                         s.current = d6;
                         s.stack.clear();
                         i
@@ -359,7 +358,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
             14 => { //– endchar (14) ⊦
                 trace!("endchar");
                 maybe_width(s, |n| n == 0);
-                s.contour.close();
+                s.pen.close();
                 s.done = true;
                 i
             }
@@ -391,9 +390,8 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("rmoveto");
                 require!(s.stack.len() >= 2);
                 maybe_width(s, |n| n == 2);
-                s.flush();
                 let p = s.current + v(s.stack[0], s.stack[1]);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.current = p;
                 s.stack.clear();
                 i
@@ -402,9 +400,8 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("hmoveto");
                 require!(s.stack.len() >= 1);
                 maybe_width(s, |n| n == 1);
-                s.flush();
                 let p = s.current + v(s.stack[0], 0.);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.current = p;
                 s.stack.clear();
                 i

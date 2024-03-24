@@ -5,7 +5,7 @@ use nom::{IResult,
 use tuple::{TupleElements};
 use itertools::Itertools;
 use indexmap::IndexMap;
-use crate::{Font, Glyph, State, v, R, IResultExt, Context, HMetrics, TryIndex, GlyphId, Name, Value, Info, FontError};
+use crate::{v, Context, Encoder, Font, FontError, Glyph, GlyphId, HMetrics, IResultExt, Info, Name, Pen, Shape, State, TryIndex, Value, R};
 use crate::postscript::{Vm, RefItem};
 use crate::eexec::Decoder;
 use crate::parsers::parse;
@@ -18,8 +18,8 @@ use pathfinder_geometry::{
 use istring::TinyString;
 
 #[derive(Clone)]
-pub struct Type1Font {
-    glyphs: IndexMap<String, Glyph>, // namee -> glyph
+pub struct Type1Font<E: Encoder> {
+    glyphs: IndexMap<String, Glyph<E>>, // namee -> glyph
     pub codepoints: HashMap<u32, u32>, // codepoint -> glyph id
     pub unicode_map: HashMap<TinyString, u32>,
     font_matrix: Transform2F,
@@ -27,18 +27,18 @@ pub struct Type1Font {
     name: Name,
     info: Info,
 }
-impl Font for Type1Font {
+impl<E: Encoder + 'static> Font<E> for Type1Font<E> {
     fn num_glyphs(&self) -> u32 {
         self.glyphs.len() as u32
     }
     fn font_matrix(&self) -> Transform2F {
         self.font_matrix
     }
-    fn glyph(&self, gid: GlyphId) -> Option<Glyph> {
-        self.glyphs.get_index(gid.0 as usize).map(|(_, glyph)| glyph.clone())
+    fn glyph(&self, gid: GlyphId) -> Option<&Glyph<E>> {
+        self.glyphs.get_index(gid.0 as usize).map(|(_, glyph)| glyph)
     }
     fn is_empty_glyph(&self, gid: GlyphId) -> bool {
-        self.glyphs.get_index(gid.0 as usize).map(|(_, glyph)| glyph.path.len() == 0).unwrap_or(true)
+        self.glyphs.get_index(gid.0 as usize).map(|(_, glyph)| matches!(glyph.shape, Shape::Empty)).unwrap_or(true)
     }
     fn gid_for_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
         let &index = self.codepoints.get(&codepoint)?;
@@ -62,24 +62,24 @@ impl Font for Type1Font {
     }
 }
 
-impl Type1Font {
-    pub fn parse_pfa(data: &[u8]) -> Result<Self, FontError> {
+impl<E: Encoder> Type1Font<E> {
+    pub fn parse_pfa(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let mut vm = Vm::new();
         vm.parse_and_exec(data)?;
-        Self::from_vm(vm)
+        Self::from_vm(vm, encoder)
     }
-    pub fn parse_pfb(data: &[u8]) -> Result<Self, FontError> {
+    pub fn parse_pfb(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let mut vm = Vm::new();
         parse_pfb(&mut vm, data)?;
-        Self::from_vm(vm)
+        Self::from_vm(vm, encoder)
     }
-    pub fn parse_postscript(data: &[u8]) -> Result<Self, FontError> {
+    pub fn parse_postscript(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let mut vm = Vm::new();
         vm.parse_and_exec(data)?;
-        Self::from_vm(vm)
+        Self::from_vm(vm, encoder)
     }
         
-    pub fn from_vm(vm: Vm) -> Result<Self, FontError> {
+    pub fn from_vm(vm: Vm, encoder: &mut E) -> Result<Self, FontError> {
         let (_font_name, font_dict) = expect!(vm.fonts().nth(0), "no font in vm");
         
         let private_dict = expect!(font_dict.get_dict("Private"), "no /Private dict");
@@ -130,26 +130,29 @@ impl Type1Font {
         
         let mut glyphs = IndexMap::with_capacity(char_strings.len());
         let mut unicode_map = HashMap::with_capacity(char_strings.len());
-        let mut state = State::new();
         for (name, item) in char_strings.string_entries() {
             let data = expect!(item.as_bytes(), "data is not bytes");
 
             let decoded = Decoder::charstring().decode(&data, len_iv);
             //debug!("{} decoded: {:?}", name, String::from_utf8_lossy(&decoded));
-            
-            if let Err(e) = charstring(&decoded, &context, &mut state) {
-                warn!("Failed to decode charstring for glyph {name}: {e:?}");
-                continue;
-            }
-
+            let ((lsb, char_width), path) = match encoder.encode_shape::<_, FontError>(|mut pen| {
+                let mut state = State::new(&mut pen, vec![]);
+                charstring(&decoded, &context, &mut state)?;
+                Ok((state.lsb, state.char_width))
+            }) {
+                Err(e) =>  {
+                    warn!("Failed to decode charstring for glyph {name}: {e:?}");
+                    continue;
+                }
+                Ok(t) => t
+            };
             let (index, _) = glyphs.insert_full(name.to_owned(), Glyph {
                 metrics: HMetrics {
-                    advance: expect!(state.char_width, "CharWidth not set"),
-                    lsb: state.lsb.unwrap_or_default()
+                    advance: expect!(char_width, "CharWidth not set"),
+                    lsb: lsb.unwrap_or_default()
                 },
-                path: state.take_path(),
+                shape: Shape::Simple(path)
             });
-            state.clear();
 
             if let Some(unicode) = glyphname_to_unicode(name) {
                 debug!("{} -> {} @ {}", name, unicode, index);
@@ -267,7 +270,7 @@ fn parse_pfb(mut vm: &mut Vm, i: &[u8]) -> Result<(), FontError> {
     
     Ok(())
 }
-pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State) -> Result<(), FontError>
+pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: &'b mut State<impl Pen>) -> Result<(), FontError>
     where T: TryIndex + 'a, U: TryIndex + 'a
 {
     let mut ps_stack = vec![];
@@ -287,10 +290,9 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
             4 => { // ⊦ dy vmoveto (4) ⊦
                 trace!("vmoveto");
                 require!(s.stack.len() >= 1);
-                s.flush();
 
                 let p = s.current + v(0., s.stack[0]);
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.stack.clear();
                 s.current = p;
             }
@@ -298,7 +300,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("rlineto");
                 require!(s.stack.len() >= 2);
                 let p = s.current + v(s.stack[0], s.stack[1]);
-                s.contour.push_endpoint(p);
+                s.pen.line_to(p);
                 s.stack.clear();
                 s.current = p;
             }
@@ -306,7 +308,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("hlineto");
                 require!(s.stack.len() >= 1);
                 let p = s.current + v(s.stack[0], 0.);
-                s.contour.push_endpoint(p);
+                s.pen.line_to(p);
                 s.stack.clear();
                 s.current = p;
             }
@@ -314,7 +316,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("vlineto");
                 require!(s.stack.len() >= 1);
                 let p = s.current + v(0., s.stack[0],);
-                s.contour.push_endpoint(p);
+                s.pen.line_to(p);
                 s.stack.clear();
                 s.current = p;
             }
@@ -324,13 +326,13 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 let c1 = s.current + v(s.stack[0], s.stack[1]);
                 let c2 = c1 + v(s.stack[2], s.stack[3]);
                 let p = c2 + v(s.stack[4], s.stack[5]);
-                s.contour.push_cubic(c1, c2, p);
+                s.pen.cubic_to(c1, c2, p);
                 s.stack.clear();
                 s.current = p;
             }
             9 => { // –closepath (9) ⊦
                 trace!("closepath");
-                s.contour.close();
+                s.pen.close();
                 s.stack.clear();
             }
             10 => { // subr# callsubr (10) –
@@ -404,8 +406,8 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                                 let flex_sequence = expect!(s.flex_sequence.take(), "no flex sequence");
                                 let (_ref, c0, c1, p2, c3, c4, p5) = expect!(TupleElements::from_iter(flex_sequence.into_iter()), "can't parse flex sequence");
                                 //require_eq!(p5, v(x, y));
-                                s.contour.push_cubic(c0, c1, p2);
-                                s.contour.push_cubic(c3, c4, p5);
+                                s.pen.cubic_to(c0, c1, p2);
+                                s.pen.cubic_to(c3, c4, p5);
                                 ps_stack.push(y);
                                 ps_stack.push(x);
                             }
@@ -458,8 +460,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 if let Some(ref mut points) = s.flex_sequence {
                     points.push(p);
                 } else {
-                    s.flush();
-                    s.contour.push_endpoint(p);
+                    s.pen.move_to(p);
                 }
                 s.current = p;
                 s.stack.clear();
@@ -468,8 +469,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 trace!("hmoveto");
                 let (dx, ) = s.args()?;
                 let p = s.current + v(dx, 0.);
-                s.flush();
-                s.contour.push_endpoint(p);
+                s.pen.move_to(p);
                 s.current = p;
                 s.stack.clear();
             }
@@ -479,7 +479,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 let c1 = s.current + v(0., dy1);
                 let c2 = c1 + v(dx2, dy2);
                 let p = c2 + v(dx3, 0.);
-                s.contour.push_cubic(c1, c2, p);
+                s.pen.cubic_to(c1, c2, p);
                 s.stack.clear();
                 s.current = p;
             }
@@ -489,7 +489,7 @@ pub fn charstring<'a, 'b, T, U>(mut input: &'a [u8], ctx: &'a Context<T, U>, s: 
                 let c1 = s.current + v(dx1, 0.);
                 let c2 = c1 + v(dx2, dy2);
                 let p = c2 + v(0., dy3);
-                s.contour.push_cubic(c1, c2, p);
+                s.pen.cubic_to(c1, c2, p);
                 s.stack.clear();
                 s.current = p;
             },

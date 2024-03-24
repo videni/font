@@ -3,8 +3,8 @@
 use std::convert::TryInto;
 use std::collections::HashMap;
 use std::ops::Deref;
-use crate::{Font, R, IResultExt, VMetrics, HMetrics, Glyph, GlyphId, Name, FontInfo, FontType, Info, FontError, ParseResult};
-use crate::truetype::{Shape, parse_shapes, get_outline};
+use crate::{Encoder, Font, FontError, FontInfo, FontType, Glyph, GlyphId, HMetrics, IResultExt, Info, Name, ParseResult, VMetrics, R};
+use crate::truetype::parse_glyphs;
 #[cfg(feature="cff")]
 use crate::cff::read_cff;
 use pdf_encoding::Encoding;
@@ -16,7 +16,6 @@ use nom::{
     bytes::complete::take,
     sequence::tuple,
 };
-use pathfinder_content::outline::Outline;
 use pathfinder_geometry::{vector::Vector2F, transform2d::Transform2F, rect::RectF};
 use itertools::Either;
 
@@ -47,8 +46,7 @@ use kern::parse_kern;
 use base::parse_base;
 
 #[derive(Clone)]
-pub struct OpenTypeFont {
-    outlines: Vec<Outline>,
+pub struct OpenTypeFont<E: Encoder> {
     pub gpos: Option<GPos>,
     pub cmap: Option<CMap>,
     encoding: Option<Encoding>,
@@ -68,37 +66,44 @@ pub struct OpenTypeFont {
     num_glyphs: u32,
     name: Name,
     info: Info,
+    glyphs: Vec<Glyph<E>>,
 }
-impl OpenTypeFont {
-    pub fn parse(data: &[u8]) -> Result<Self, FontError> {
+pub fn info(data: &[u8]) -> Result<FontInfo, FontError> {
+    let tables = parse_tables(data)?;
+    let name = tables.get(b"name").map(|data| parse_name(data)).transpose()?.unwrap_or_default();
+    let cmap = tables.get(b"cmap").map(|data| parse_cmap(data)).transpose()?;
+
+    Ok(FontInfo {
+        name,
+        typ: FontType::OpenType,
+        codepoints: cmap.map(|cmap| cmap.0.codepoints(10)).unwrap_or_default(),
+    })
+}
+impl<E: Encoder> OpenTypeFont<E> {
+    pub fn parse(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let tables = t!(parse_tables(data));
         for (tag, _) in tables.entries() {
             debug!("tag: {:?} ({:?})", tag, std::str::from_utf8(&tag));
         }
         
-        OpenTypeFont::from_tables(tables)
+        OpenTypeFont::from_tables(tables, encoder)
     }
-    pub fn info(data: &[u8]) -> Result<FontInfo, FontError> {
-        let tables = parse_tables(data)?;
-        let name = tables.get(b"name").map(|data| parse_name(data)).transpose()?.unwrap_or_default();
-        let cmap = tables.get(b"cmap").map(|data| parse_cmap(data)).transpose()?;
-
-        Ok(FontInfo {
-            name,
-            typ: FontType::OpenType,
-            codepoints: cmap.map(|cmap| cmap.0.codepoints(10)).unwrap_or_default(),
-        })
-    }
-    pub fn from_hmtx_glyf_and_tables(hmtx: Option<Hmtx>, glyf: Option<Vec<Shape>>, tables: Tables<impl Deref<Target=[u8]>>) -> Result<Self, FontError> {
-        let outlines: Vec<_>;
+    pub fn from_hmtx_glyf_and_tables(hmtx: Option<Hmtx>, glyf: Option<Vec<Glyph<E>>>, tables: Tables<impl Deref<Target=[u8]>>, encoder: &mut E) -> Result<Self, FontError> {
+        let glyphs: Vec<_>;
         let font_matrix;
         let bbox;
         
         if let Some(cff) = tables.get(b"CFF ") {
-            #[cfg(feature="cff")]{
+            #[cfg(feature="cff")] {
             let slot = t!(read_cff(cff)?.slot(0));
             bbox = slot.bbox();
-            outlines = t!(slot.outlines()?.map(|r| r.map(|(outline, _, _)| outline)).collect::<Result<_, _>>());
+            glyphs = t!(slot.outlines(encoder)?.enumerate()
+                .map(|(i, r)| r.map(|(shape, _, _)|
+                    Glyph {
+                        metrics: hmtx.as_ref().map(|h| h.metrics_for_gid(i as u16)).unwrap_or_default(),
+                        shape
+                    }
+                )).collect::<Result<_, _>>());
             font_matrix = slot.font_matrix();
             }
             #[cfg(not(feature="cff"))]
@@ -107,14 +112,14 @@ impl OpenTypeFont {
             let head = t!(parse_head(expect!(tables.get(b"head"), "no head")));
             bbox = Some(head.bbox());
             font_matrix = Transform2F::from_scale(Vector2F::splat(1.0 / head.units_per_em as f32));
-            outlines = glyf.map(|shapes| (0 .. shapes.len()).filter_map(|idx| get_outline(&shapes, idx as u32)).collect()).unwrap_or_default();
+            glyphs = glyf.unwrap_or_default();
         }
 
         #[cfg(feature="svg")]
         let svg = t!(tables.get(b"SVG ").map(|data| parse_svg(data)).transpose());
         
         let maxp = t!(tables.get(b"maxp").map(parse_maxp).transpose());
-        let num_glyphs = maxp.as_ref().map(|maxp| maxp.num_glyphs as u32).unwrap_or(outlines.len() as u32);
+        let num_glyphs = maxp.as_ref().map(|maxp| maxp.num_glyphs as u32).unwrap_or(glyphs.len() as u32);
 
         let gpos = if let Some(data) = tables.get(b"GPOS") {
             let maxp = expect!(maxp.as_ref(), "no maxp");
@@ -148,7 +153,7 @@ impl OpenTypeFont {
         let weight = t!(tables.get(b"OS/2").map(|data| os2::parse_os2(data)).transpose()).map(|os2| os2.weight);
 
         Ok(OpenTypeFont {
-            outlines,
+            glyphs,
             gpos,
             cmap,
             hmtx,
@@ -174,41 +179,36 @@ impl OpenTypeFont {
             },
         })
     }
-    pub fn from_tables<T>(tables: Tables<T>) -> Result<Self, FontError> where T: Deref<Target=[u8]> {
+    pub fn from_tables<T>(tables: Tables<T>, encoder: &mut E) -> Result<Self, FontError> where T: Deref<Target=[u8]> {
         let head = t!(parse_head(expect!(tables.get(b"head"), "no head")));
         let maxp = t!(parse_maxp(expect!(tables.get(b"maxp"), "no maxp")));
         let hhea = t!(parse_hhea(expect!(tables.get(b"hhea"), "no hhea")));
+        let hmtx = t!(tables.get(b"hmtx").map(|data| parse_hmtx(data, &hhea, &maxp).get()).transpose());
         
         let glyf = t!(tables.get(b"glyf").map(|data| {
             let loca = parse_loca(expect!(tables.get(b"loca"), "no loca"), &head, &maxp)?;
-            parse_shapes(&loca, data)
+            parse_glyphs(&loca, data, hmtx.as_ref().unwrap_or(&Hmtx::default()), encoder)
         }).transpose());
         
-        let hmtx = t!(tables.get(b"hmtx").map(|data| parse_hmtx(data, &hhea, &maxp).get()).transpose());
         
-        OpenTypeFont::from_hmtx_glyf_and_tables(hmtx, glyf, tables)
+        OpenTypeFont::from_hmtx_glyf_and_tables(hmtx, glyf, tables, encoder)
     }
     pub fn glyph_metrics(&self, gid: u16) -> Option<HMetrics> {
         self.hmtx.as_ref().map(|hmtx| hmtx.metrics_for_gid(gid))
     }
 }
-impl Font for OpenTypeFont {
+impl<E: Encoder + 'static> Font<E> for OpenTypeFont<E> {
     fn num_glyphs(&self) -> u32 {
         self.num_glyphs
     }
     fn font_matrix(&self) -> Transform2F {
         self.font_matrix
     }
-    fn glyph(&self, gid: GlyphId) -> Option<Glyph> {
-        self.outlines.get(gid.0 as usize).map(|outline| {
-            Glyph {
-                path: outline.clone(),
-                metrics: self.hmtx.as_ref().map(|m| m.metrics_for_gid(gid.0 as u16)).unwrap_or_default()
-            }
-        })
+    fn glyph(&self, gid: GlyphId) -> Option<&Glyph<E>>  {
+        self.glyphs.get(gid.0 as usize)
     }
     fn is_empty_glyph(&self, gid: GlyphId) -> bool {
-        self.outlines.get(gid.0 as usize).map(|o| o.len() == 0).unwrap_or(true)
+        self.glyphs.get(gid.0 as usize).map(|g| g.shape.is_empty()).unwrap_or(true)
     }
 
     #[cfg(feature="svg")]
@@ -404,7 +404,7 @@ impl Into<VMetrics> for Hhea {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Hmtx {
     metrics: Vec<(u16, i16)>, // (advance, lsb)
     lsbs: Vec<i16>,

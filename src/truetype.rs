@@ -1,16 +1,18 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::iter;
 use std::ops::Deref;
 use crate::opentype::post::parse_post;
-use crate::{Font, Glyph, R, IResultExt, GlyphId, Name, Info, FontError};
+use crate::{Encoder, Font, FontError, Glyph, GlyphId, HMetrics, IResultExt, Info, Name, Pen, Shape, R};
 use crate::parsers::{iterator, parse};
+use itertools::Itertools;
+use pathfinder_geometry::transform2d::Matrix2x2F;
 use pdf_encoding::Encoding;
 use nom::{
     number::complete::{be_u8, be_i8, be_i16, be_u16},
     bytes::complete::take,
     sequence::tuple
 };
-use pathfinder_content::outline::{Outline, Contour};
 use pathfinder_geometry::{vector::Vector2F, transform2d::Transform2F, rect::RectF};
 use crate::opentype::{
     parse_tables, parse_head, parse_maxp, parse_loca,
@@ -20,19 +22,11 @@ use crate::opentype::{
     gpos::KernTable,
     os2::parse_os2,
 };
-use pathfinder_geometry::{transform2d::Matrix2x2F};
-use itertools::Itertools;
+
 
 #[derive(Clone)]
-pub enum Shape {
-    Simple(Outline),
-    Compound(Vec<(u32, Transform2F)>),
-    Empty
-}
-
-#[derive(Clone)]
-pub struct TrueTypeFont {
-    shapes: Vec<Shape>,
+pub struct TrueTypeFont<E: Encoder> {
+    glyphs: Vec<Glyph<E>>,
     pub cmap: Option<CMap>,
     encoding: Option<Encoding>,
     hmtx: Hmtx,
@@ -44,23 +38,29 @@ pub struct TrueTypeFont {
     pub name_map: HashMap<String, u16>,
 }
 
-impl TrueTypeFont {
-    pub fn parse(data: &[u8]) -> Result<Self, FontError> {
+#[derive(Clone)]
+pub struct GlyphStorage {
+    pub loca: Vec<u32>,
+    pub glyf: Vec<u8>,
+}
+
+impl<E: Encoder> TrueTypeFont<E> {
+    pub fn parse(data: &[u8], encoder: &mut E) -> Result<Self, FontError> {
         let tables = parse_tables(data)?;
-        TrueTypeFont::parse_glyf(tables)
+        TrueTypeFont::parse_glyf(tables, encoder)
     }
-    pub fn parse_glyf(tables: Tables<impl Deref<Target=[u8]>>) -> Result<Self, FontError> {
+    pub fn parse_glyf(tables: Tables<impl Deref<Target=[u8]>>, encoder: &mut E) -> Result<Self, FontError> {
         let head = parse_head(expect!(tables.get(b"head"), "no head"))?;
         let maxp = parse_maxp(expect!(tables.get(b"maxp"), "no maxp"))?;
         let loca = parse_loca(expect!(tables.get(b"loca"), "no loca"), &head, &maxp)?;
         let hhea = parse_hhea(expect!(tables.get(b"hhea"), "no hhea"))?;
         let hmtx = parse_hmtx(expect!(tables.get(b"hmtx"), "no hmtx"), &hhea, &maxp).get()?;
         
-        let shapes = parse_shapes(&loca, expect!(tables.get(b"glyf"), "no glyf"))?;
+        let glyphs = parse_glyphs(&loca, expect!(tables.get(b"glyf"), "no glyf"), &hmtx, encoder)?;
         
-        TrueTypeFont::from_shapes_and_metrics(tables, shapes, hmtx)
+        TrueTypeFont::from_shapes_and_metrics(tables, glyphs, hmtx)
     }
-    pub fn from_shapes_and_metrics(tables: Tables<impl Deref<Target=[u8]>>, shapes: Vec<Shape>, hmtx: Hmtx) -> Result<TrueTypeFont, FontError> {
+    pub fn from_shapes_and_metrics(tables: Tables<impl Deref<Target=[u8]>>, glyphs: Vec<Glyph<E>>, hmtx: Hmtx) -> Result<TrueTypeFont<E>, FontError> {
         let head = parse_head(expect!(tables.get(b"head"), "no head"))?;
         let (cmap, encoding) = match tables.get(b"cmap").map(|data| parse_cmap(data)).transpose()? {
             Some((cmap, encoding)) => (Some(cmap), Some(encoding)),
@@ -76,7 +76,6 @@ impl TrueTypeFont {
         }
         
         Ok(TrueTypeFont {
-            shapes,
             cmap,
             encoding,
             hmtx,
@@ -88,41 +87,27 @@ impl TrueTypeFont {
                 weight: os2.map(|t| t.weight),
             },
             name_map,
+            glyphs,
         })
     }
-    fn get_path(&self, idx: u32) -> Option<Outline> {
-        get_outline(&self.shapes, idx)
-    }
 }
-impl Font for TrueTypeFont {
+
+
+impl<E: Encoder + 'static> Font<E> for TrueTypeFont<E> {
     fn num_glyphs(&self) -> u32 {
-        self.shapes.len() as u32
+        self.glyphs.len() as u32
     }
     fn font_matrix(&self) -> Transform2F {
         let scale = 1.0 / self.units_per_em as f32;
         Transform2F::from_scale(Vector2F::splat(scale.into()))
     }
-    fn glyph(&self, id: GlyphId) -> Option<Glyph> {
-        if id.0 > u16::max_value() as u32 {
-            return None;
-        }
-        
-        debug!("get gid {:?}", id);
-        let path = self.get_path(id.0)?;
-        let metrics = self.hmtx.metrics_for_gid(id.0 as u16);
-        
-        Some(Glyph {
-            path,
-            metrics
-        })
+    fn glyph(&self, id: GlyphId) -> Option<&Glyph<E>> {
+        self.glyphs.get(id.0 as usize)
     }
     fn is_empty_glyph(&self, gid: GlyphId) -> bool {
-        if gid.0 > u16::max_value() as u32 {
-            return true;
-        }
-        match self.shapes.get(gid.0 as usize) {
+        match self.glyphs.get(gid.0 as usize) {
             None => true,
-            Some(Shape::Empty) => true,
+            Some(Glyph { metrics, shape: Shape::Empty }) => true,
             _ => false
         }
     }
@@ -174,19 +159,20 @@ fn fraction_i16(i: &[u8]) -> R<f32> {
     Ok((i, s as f32 / 16384.0))
 }
 
-pub fn parse_shapes(loca: &[u32], data: &[u8]) -> Result<Vec<Shape>, FontError> {
-    let mut shapes = Vec::with_capacity(loca.len() - 1);
+pub fn parse_glyphs<E: Encoder>(loca: &[u32], data: &[u8], hmtx: &Hmtx, encoder: &mut E) -> Result<Vec<Glyph<E>>, FontError> {
+    let mut glyphs = Vec::with_capacity(loca.len() - 1);
     for (i, (start, end)) in loca.iter().cloned().tuple_windows().enumerate() {
         let slice = expect!(data.get(start as usize .. end as usize), "out of bounds");
         //debug!("gid {} : data[{} .. {}]", i, start, end);
-        let shape = parse_glyph_shape(slice)?;
-        shapes.push(shape);
+        let shape = parse_glyph_shape(slice, encoder)?;
+        let metrics = hmtx.metrics_for_gid(i as u16);
+        glyphs.push(Glyph { shape, metrics });
     }
-    Ok(shapes)
+    Ok(glyphs)
 }
 // the following code is borrowed from stb-truetype and modified heavily
 
-fn parse_glyph_shape(data: &[u8]) -> Result<Shape, FontError> {
+fn parse_glyph_shape<E: Encoder>(data: &[u8], encoder: &mut E) -> Result<Shape<E>, FontError> {
     if data.len() == 0 {
         return Ok(Shape::Empty);
     }
@@ -196,13 +182,13 @@ fn parse_glyph_shape(data: &[u8]) -> Result<Shape, FontError> {
     //debug!("n_contours: {}", number_of_contours);
     match number_of_contours {
         0 => Ok(Shape::Empty),
-        n if n >= 0 => glyph_shape_positive_contours(i, number_of_contours as usize),
+        n if n >= 0 => glyph_shape_positive_contours(i, number_of_contours as usize, encoder),
         -1 => compound(i).get(),
         n => error!("Contour format {} not supported.", n)
     }
 }
 
-pub fn compound(mut input: &[u8]) -> R<Shape> {
+pub fn compound<E: Encoder>(mut input: &[u8]) -> R<Shape<E>> {
     // Compound shapes
     let mut parts = Vec::new();
     loop {
@@ -235,7 +221,7 @@ pub fn compound(mut input: &[u8]) -> R<Shape> {
         }
 
         // Get indexed glyph.
-        parts.push((gidx as u32, transform));
+        parts.push((GlyphId(gidx as u32), transform));
         // More components ?
         if flags & 0x20 == 0 {
             break;
@@ -244,23 +230,6 @@ pub fn compound(mut input: &[u8]) -> R<Shape> {
     Ok((input, Shape::Compound(parts)))
 }
 
-pub fn get_outline(shapes: &[Shape], idx: u32) -> Option<Outline> {
-    match shapes.get(idx as usize)? {
-        &Shape::Simple(ref path) => Some(path.clone()),
-        &Shape::Compound(ref parts) => {
-            let mut outline = Outline::new();
-            for &(gid, tr) in parts {
-                if let Some(Shape::Simple(ref path)) = shapes.get(gid as usize) {
-                    let mut path = path.clone();
-                    path.transform(&tr);
-                    outline.push_outline(path);
-                }
-            }
-            Some(outline)
-        }
-        &Shape::Empty => Some(Outline::new())
-    }
-}
 
 #[derive(Copy, Clone, Debug)]
 struct FlagData {
@@ -287,7 +256,7 @@ fn parse_coord(short: bool, same_or_pos: bool) -> impl Fn(&[u8]) -> R<i16> {
 fn mid(a: Vector2F, b: Vector2F) -> Vector2F {
     (a + b) * 0.5
 }
-fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<Shape, FontError> {
+fn glyph_shape_positive_contours<E: Encoder>(i: &[u8], number_of_contours: usize, encoder: &mut E) -> Result<Shape<E>, FontError> {
     let (i, point_indices) = take(2 * number_of_contours)(i)?;
     let (i, num_instructions) = be_u16(i)?;
     let (mut i, _instructions) = take(num_instructions)(i)?;
@@ -330,23 +299,23 @@ fn glyph_shape_positive_contours(i: &[u8], number_of_contours: usize) -> Result<
         (flags & 1 != 0, Vector2F::new(p.0 as f32, p.1 as f32))
     );
     let mut start = 0;
-    let mut outline = Outline::new();
-    for end in iterator(point_indices, be_u16) {
-        let n_points = end + 1 - start;
-        start += n_points;
-        
-        if let Some(contour) = contour((&mut points).take(n_points as usize)) {
-            outline.push_contour(contour);
+    let (_, glyph) = encoder.encode_shape::<(), Infallible>(move |mut pen| {
+        for end in iterator(point_indices, be_u16) {
+            let n_points = end + 1 - start;
+            start += n_points;
+            
+            contour((&mut points).take(n_points as usize), &mut pen);
         }
-    }
+        Ok(())
+    }).unwrap();
     
-    Ok(Shape::Simple(outline))
+    Ok(Shape::Simple(glyph))
 }
 
-pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> {
+pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>, pen: &mut impl Pen) {
     let mut points = points.peekable();
     
-    let (start_on, p) = points.next()?;
+    let Some((start_on, p)) = points.next() else { return };
     let start_off = !start_on;
     let (s, sc) = if start_off {
         // if we start off with an off-curve point, then when we need to find a
@@ -355,10 +324,7 @@ pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> 
         // when we wraparound.
         let sc = p;
 
-        let (next_on, next_p) = match points.peek() {
-            Some(&t) => t,
-            None => return None,
-        };
+        let Some(&(next_on, next_p)) = points.peek() else { return };
 
         let p = if !next_on {
             // next point is also a curve point, so interpolate an on-point curve
@@ -375,8 +341,7 @@ pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> 
         (p, None)
     };
     
-    let mut contour = Contour::new();
-    contour.push_endpoint(s);
+    pen.move_to(s);
     
     let mut c = None;
     for (on_curve, p) in points {
@@ -385,31 +350,30 @@ pub fn contour(points: impl Iterator<Item=(bool, Vector2F)>) -> Option<Contour> 
             if let Some(c) = c {
                 // two off-curve control points in a row means interpolate an on-curve
                 // midpoint
-                contour.push_quadratic(c, mid(c, p));
+                pen.quad_to(c, mid(c, p));
             }
             c = Some(p);
         } else {
             if let Some(c) = c.take() {
-                contour.push_quadratic(c, p);
+                pen.quad_to(c, p);
             } else {
-                contour.push_endpoint(p);
+                pen.line_to(p);
             }
         }
     }
     
     if let Some(sc) = sc {
         if let Some(c) = c {
-            contour.push_quadratic(c, mid(c, sc));
+            pen.quad_to(c, mid(c, sc));
         }
-        contour.push_quadratic(sc, s);
+        pen.quad_to(sc, s);
     } else {
         if let Some(c) = c {
-            contour.push_quadratic(c, s);
+            pen.quad_to(c, s);
         } else {
-            contour.push_endpoint(s);
+            pen.line_to(s);
         }
     }
 
-    contour.close();
-    Some(contour)
+    pen.close();
 }
