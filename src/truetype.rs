@@ -304,7 +304,7 @@ fn glyph_shape_positive_contours<E: Encoder>(i: &[u8], number_of_contours: usize
             let n_points = end + 1 - start;
             start += n_points;
             
-            contour((&mut points).take(n_points as usize), &mut pen);
+            contour((&mut points).take(n_points as usize), pen);
         }
         Ok(())
     }).unwrap();

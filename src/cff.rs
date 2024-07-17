@@ -307,8 +307,8 @@ impl<'a> CffSlot<'a> {
         // build glyphs
         Ok(self.char_strings.iter().enumerate().map(move |(id, data)| {
             trace!("charstring for glyph {}", id);
-            encoder.encode_shape(|mut pen| {
-                let mut state = State::new(&mut pen, vec![]);
+            encoder.encode_shape(|pen| {
+                let mut state = State::new(pen, vec![]);
                 let subr_bias = match char_string_type {
                     CharstringType::Type2 => bias(self.subrs[id].len()),
                     CharstringType::Type1 => 0

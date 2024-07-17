@@ -136,7 +136,7 @@ impl<E: Encoder> Type1Font<E> {
             let decoded = Decoder::charstring().decode(&data, len_iv);
             //debug!("{} decoded: {:?}", name, String::from_utf8_lossy(&decoded));
             let ((lsb, char_width), path) = match encoder.encode_shape::<_, FontError>(|mut pen| {
-                let mut state = State::new(&mut pen, vec![]);
+                let mut state = State::new(pen, vec![]);
                 charstring(&decoded, &context, &mut state)?;
                 Ok((state.lsb, state.char_width))
             }) {

@@ -4,16 +4,14 @@
 
 use std::fmt;
 use std::convert::TryInto;
-use std::any::TypeId;
 use nom::{IResult, Err::*, error::VerboseError};
-use tuple::{TupleElements};
+use tuple::TupleElements;
 use pdf_encoding::Encoding;
 
 #[cfg(feature="svg")]
 pub use svg::SvgGlyph;
 
 use pathfinder_geometry::{rect::RectF, vector::Vector2F, transform2d::Transform2F};
-use pathfinder_content::outline::{Outline, Contour};
 
 #[derive(Clone)]
 pub struct Glyph<E: Encoder> {
@@ -68,7 +66,7 @@ pub struct Info {
     pub weight: Option<u16>,
 }
 
-pub trait Font<E: Encoder>: 'static {
+pub trait Font<E: Encoder> {
     /// Return the "number of glyphs" in the font.
     ///
     /// This may or may not correlate to the actual number of "real glyphs".
@@ -147,12 +145,6 @@ pub trait Font<E: Encoder>: 'static {
     fn name(&self) -> &Name;
 
     fn info(&self) -> &Info;
-
-    #[doc(hidden)]
-    // this function must return the type id of the impl
-    unsafe fn _type_id(&self) -> TypeId {
-        TypeId::of::<Self>()
-    }
 }
 
 pub trait Pen {
@@ -167,7 +159,7 @@ pub trait Encoder {
     type Pen<'a>: Pen;
     type GlyphRef: Clone;
 
-    fn encode_shape<'f, O, E>(&mut self, f: impl for<'a> FnMut(Self::Pen<'a>) -> Result<O, E> + 'f) -> Result<(O, Self::GlyphRef), E>;
+    fn encode_shape<'f, O, E>(&mut self, f: impl for<'a> FnMut(&'a mut Self::Pen<'a>) -> Result<O, E> + 'f) -> Result<(O, Self::GlyphRef), E>;
 }
 
 
@@ -200,7 +192,7 @@ mod vello_impl {
     }
 }
 
-mod pathfinder_impl {
+pub mod pathfinder_impl {
     use pathfinder_content::outline::{Outline, Contour};
     use pathfinder_geometry::vector::Vector2F;
 
@@ -286,7 +278,6 @@ pub use type1::Type1Font;
 #[cfg(feature="opentype")]
 pub use opentype::OpenTypeFont;
 
-use vello_encoding::Transform;
 #[cfg(feature="woff")]
 pub use woff::{parse_woff, parse_woff2};
 
@@ -547,6 +538,122 @@ pub fn font_type(data: &[u8]) -> Option<FontType> {
 }
 
 pub enum FontVariant<E: Encoder> {
+    #[cfg(feature="opentype")]
+    OpenType(OpenTypeFont<E>),
+    #[cfg(feature="opentype")]
+    TrueType(TrueTypeFont<E>),
+    #[cfg(feature="type1")]
+    Type1(Type1Font<E>),
+    #[cfg(feature="cff")]
+    Cff(CffFont<E>),
+}
+
+macro_rules! impl_variants {
+    ($(#[$meta:meta] $name:ident ($inner:ty),)*) => {
+        impl<E: Encoder + 'static> Font<E> for FontVariant<E> {
+            fn num_glyphs(&self) -> u32 {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.num_glyphs(), 
+                )* }
+            }
+        
+            fn font_matrix(&self) -> Transform2F {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.font_matrix(), 
+                )* }
+            }
+        
+            fn glyph(&self, gid: GlyphId) -> Option<&Glyph<E>> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.glyph(gid), 
+                )* }
+            }
+        
+            fn is_empty_glyph(&self, gid: GlyphId) -> bool {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.is_empty_glyph(gid), 
+                )* }
+            }
+
+            #[cfg(feature="svg")]
+            fn svg_glyph(&self, gid: GlyphId) -> Option<&SvgGlyph> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.svg_glyph(gid), 
+                )* }
+            }
+
+            fn gid_for_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_codepoint(codepoint), 
+                )* }
+            }
+
+            fn gid_for_name(&self, name: &str) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_name(name), 
+                )* }
+            }
+            fn gid_for_unicode_codepoint(&self, codepoint: u32) -> Option<GlyphId> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.gid_for_unicode_codepoint(codepoint), 
+                )* }
+            }
+            fn encoding(&self) -> Option<Encoding> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.encoding(), 
+                )* }
+            }
+            fn get_notdef_gid(&self) -> GlyphId {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.get_notdef_gid(), 
+                )* }
+            }
+            fn bbox(&self) -> Option<RectF> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.bbox(), 
+                )* }
+            }
+            fn vmetrics(&self) -> Option<VMetrics> {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.vmetrics(), 
+                )* }
+            }
+            fn kerning(&self, left: GlyphId, right: GlyphId) -> f32 {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.kerning(left, right), 
+                )* }
+            }
+        
+            fn name(&self) -> &Name {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.name(), 
+                )* }
+            }
+        
+            fn info(&self) -> &Info {
+                match self { $(
+                    #[$meta]
+                    FontVariant::$name(inner) => inner.info(), 
+                )* }
+            }
+        }
+    };
+}
+impl_variants!{
     #[cfg(feature="opentype")]
     OpenType(OpenTypeFont<E>),
     #[cfg(feature="opentype")]
