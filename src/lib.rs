@@ -159,7 +159,7 @@ pub trait Encoder {
     type Pen<'a>: Pen;
     type GlyphRef: Clone;
 
-    fn encode_shape<'f, O, E>(&mut self, f: impl for<'a> FnMut(&'a mut Self::Pen<'a>) -> Result<O, E> + 'f) -> Result<(O, Self::GlyphRef), E>;
+    fn encode_shape<'f, O, E>(&mut self, f: impl for<'a> FnMut(&mut Self::Pen<'a>) -> Result<O, E> + 'f) -> Result<(O, Self::GlyphRef), E>;
 }
 
 
